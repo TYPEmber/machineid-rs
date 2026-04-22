@@ -36,6 +36,16 @@ struct MACGeneric {
 }
 
 #[cfg(target_os = "windows")]
+// Resolve the physical disk behind the Windows OS volume instead of assuming disk index 0.
+const POWERSHELL_OS_DISK_SERIAL_COMMAND: &str = r#"$ErrorActionPreference = 'Stop';
+$driveLetter = ((Get-CimInstance -ClassName Win32_OperatingSystem).SystemDrive).TrimEnd(':');
+$disk = Get-Partition -DriveLetter $driveLetter | Get-Disk | Select-Object -First 1;
+if (-not $disk -or [string]::IsNullOrWhiteSpace($disk.SerialNumber)) {
+    throw 'failed to resolve physical disk serial for system drive'
+}
+[Console]::Out.Write($disk.SerialNumber.Trim())"#;
+
+#[cfg(target_os = "windows")]
 fn command_stdout(command: &str, args: &[&str]) -> Result<String, HWIDError> {
     let output = Command::new(command).args(args).output()?;
     if !output.status.success() {
@@ -58,13 +68,81 @@ fn command_stdout(command: &str, args: &[&str]) -> Result<String, HWIDError> {
 
 #[cfg(target_os = "windows")]
 fn get_disk_id_from_wmic() -> Result<String, HWIDError> {
+    // Ask Windows which logical drive hosts the OS. This is usually C:, but not guaranteed.
+    let os_drive_output = command_stdout("wmic", &["os", "get", "SystemDrive"])?;
+    let os_drive = os_drive_output
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty() && *line != "SystemDrive")
+        .ok_or(HWIDError::new(
+            "DiskIdError",
+            "failed to read system drive from WMIC output",
+        ))?;
+
+    let association_output = command_stdout(
+        "wmic",
+        &[
+            "path",
+            "Win32_LogicalDiskToPartition",
+            "get",
+            "Antecedent,Dependent",
+            "/value",
+        ],
+    )?;
+
+    let os_drive_marker = format!(r#"DeviceID="{}""#, os_drive);
+    let mut partition_path: Option<&str> = None;
+    let mut resolved_disk_index: Option<String> = None;
+
+    // WMIC emits Antecedent/Dependent pairs separated by blank lines.
+    for line in association_output.lines().map(str::trim) {
+        if line.is_empty() {
+            partition_path = None;
+            continue;
+        }
+
+        if let Some(value) = line.strip_prefix("Antecedent=") {
+            partition_path = Some(value);
+            continue;
+        }
+
+        if let Some(value) = line.strip_prefix("Dependent=") {
+            if !value.contains(&os_drive_marker) {
+                continue;
+            }
+
+            let partition_path = match partition_path {
+                Some(value) => value,
+                None => continue,
+            };
+
+            if let Some(start) = partition_path.find("Disk #") {
+                let index: String = partition_path[start + "Disk #".len()..]
+                    .chars()
+                    .take_while(|ch| ch.is_ascii_digit())
+                    .collect();
+                if !index.is_empty() {
+                    resolved_disk_index = Some(index);
+                    break;
+                }
+            }
+        }
+    }
+
+    let disk_index = resolved_disk_index.ok_or(HWIDError::new(
+        "DiskIdError",
+        "failed to resolve system drive disk index from WMIC output",
+    ))?;
+    let disk_index_filter = format!("Index={}", disk_index);
+
+    // Query the physical disk resolved from the OS volume association.
     let output = command_stdout(
         "wmic",
         &[
             "path",
             "Win32_DiskDrive",
             "where",
-            "Index=0",
+            disk_index_filter.as_str(),
             "get",
             "SerialNumber",
         ],
@@ -83,31 +161,32 @@ fn get_disk_id_from_wmic() -> Result<String, HWIDError> {
 
 #[cfg(target_os = "windows")]
 fn get_disk_id_from_powershell() -> Result<String, HWIDError> {
-    const POWERSHELL_DISK_SERIAL_COMMAND: &str = r#"$ErrorActionPreference = 'Stop'; Get-CimInstance -ClassName Win32_DiskDrive | Where-Object { $_.Index -eq 0 } | Select-Object -ExpandProperty SerialNumber -First 1"#;
-
     let output = command_stdout(
         "powershell",
         &[
             "-NoProfile",
             "-NonInteractive",
             "-Command",
-            POWERSHELL_DISK_SERIAL_COMMAND,
+            POWERSHELL_OS_DISK_SERIAL_COMMAND,
         ],
     )?;
 
-    output
-        .lines()
-        .map(str::trim)
-        .find(|line| !line.is_empty())
-        .map(str::to_owned)
-        .ok_or(HWIDError::new(
+    let serial = output.trim();
+    if serial.is_empty() {
+        Err(HWIDError::new(
             "DiskIdError",
             "failed to read disk serial from PowerShell output",
         ))
+    } else {
+        Ok(serial.to_owned())
+    }
 }
 
 #[cfg(target_os = "windows")]
+/// Get OS Disk Serial Number.
+/// This is more reliable than assuming the OS disk is always Disk 0, especially in multi-disk systems or those with removable drives.
 pub(crate) fn get_disk_id() -> Result<String, HWIDError> {
+    // Keep WMIC as the preferred path, but fall back to PowerShell on systems where WMIC is absent.
     match get_disk_id_from_wmic() {
         Ok(serial) => Ok(serial),
         Err(wmic_error) => match get_disk_id_from_powershell() {
